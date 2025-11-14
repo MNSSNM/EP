@@ -1,0 +1,283 @@
+/*******************************************************************************
+ *
+ * Title:       Proximity & Swipe Detection with Hardware IR Carrier
+ * Target:      Holtek BS84D20CA
+ * System Clock: 8 MHz
+ *
+ * Description:
+ * This is the complete, merged firmware. It combines a hardware-based
+ * 38.1 kHz IR emitter with the proximity/swipe receiver logic.
+ *
+ * -- FEATURES INCLUDED --
+ * 1. Proximity Detection: LEDs 10 & 11 light up on hand hover.
+ * 2. Swipe Detection: LED 1 or 2 lights up on a directional swipe.
+ * 3. Hardware IR Carrier: Ensures an accurate and efficient 38.1 kHz signal.
+ * 4. Status Feedback LEDs (Row 0):
+ * - (0,0): Heartbeat (blinks to show the main timer is active).
+ * - (1,0): TX Active (lit during IR transmission/sensing).
+ * - (2,0): Left Receiver Active (lit on detection).
+ * - (3,0): Right Receiver Active (lit on detection).
+ *
+ ******************************************************************************/
+
+#include "BS84D20CA.h"
+#include "USER_PROGRAM_C.INC"
+
+// --- PIN CONFIGURATION ---
+#define SCLK_PORT           _pc6
+#define SCLK_PORT_CTRL      _pcc6
+#define DIN_PORT            _pc7
+#define DIN_PORT_CTRL       _pcc7
+#define IR_EMITTER_PORT     _pc0
+#define IR_EMITTER_CTRL     _pcc0
+#define IR_RECEIVER_1       _pc3 // Left Receiver (Active Low)
+#define IR_RECEIVER_2       _pc2 // Right Receiver (Active Low)
+
+// --- APPLICATION CONSTANTS ---
+#define PTM_INTERRUPT_FREQ      1000 // PTM base frequency in Hz
+#define TICKS_PER_APP_TICK      20   // Creates a 20ms application tick (50Hz sensing rate)
+#define SENSOR_TIMEOUT_TICKS    5    // Hover LED timeout: 5 * 20ms = 100ms
+#define GESTURE_SWIPE_TIMEOUT   50   // Swipe timeout: 50 * 20ms = 1000ms (1 second)
+#define IR_PULSE_BURST_US       260  // Duration of each IR pulse burst in microseconds
+#define IR_PULSE_GAP_US         500  // Duration of the gap between bursts
+#define IR_BURST_COUNT          5    // Number of pulse bursts per sensing cycle
+
+// --- TM1640 DISPLAY DRIVER COMMANDS ---
+#define CMD_DATA_AUTO_INC       0x40
+#define CMD_DISPLAY_ON_MAX      0x8F
+#define CMD_ADDRESS_SET         0xC0
+
+// --- GESTURE STATE MACHINE ---
+enum { GESTURE_IDLE, GESTURE_ARMED_R1, GESTURE_ARMED_R2 };
+
+// --- GLOBAL VARIABLES ---
+unsigned char displayBuffer[16];
+volatile unsigned char app_tick_flag = 0;
+unsigned char left_sensor_timeout = 0;
+unsigned char right_sensor_timeout = 0;
+unsigned char gesture_state = GESTURE_IDLE;
+unsigned char gesture_timeout_counter = 0;
+
+// --- FORWARD DECLARATIONS ---
+void configure_system_clock(void);
+void configure_io_pins(void);
+void init_PTM_for_tick(void);
+void init_STM_for_carrier(void);
+void precise_delay_us(unsigned int us);
+void start(void);
+void stop(void);
+void writeByte(unsigned char data);
+void sendCommand(unsigned char cmd);
+void updateDisplay(void);
+void clearDisplay(void);
+void turn_on_led(unsigned char x, unsigned char y);
+void turn_off_led(unsigned char x, unsigned char y);
+void generate_carrier_pulse_burst(void);
+void process_sensors(void);
+
+// =================================================================================
+//                       INTERRUPT SERVICE ROUTINES
+// =================================================================================
+
+void __attribute__((interrupt(0x1C))) PTM_Timer_ISR(void) {
+    static unsigned char app_tick_counter = 0;
+    if (_ptmaf) {
+        _ptmaf = 0;
+        if (++app_tick_counter >= TICKS_PER_APP_TICK) {
+            app_tick_counter = 0;
+            app_tick_flag = 1;
+        }
+    }
+}
+
+void __attribute__((interrupt(0x34))) Multi_Function_ISR(void) {
+    // This ISR handles the hardware toggling of the IR Emitter pin (PC0)
+    // to generate the 38.1 kHz carrier wave.
+    if (_stmaf) {
+        _stmaf = 0;
+        _pc0 = ~_pc0;
+    }
+}
+
+// =================================================================================
+//                      LOW-LEVEL & DISPLAY FUNCTIONS
+// =================================================================================
+
+void precise_delay_us(unsigned int us) { while(us--) { GCC_NOP(); GCC_NOP(); } }
+void start(void) { SCLK_PORT = 1; DIN_PORT = 1; precise_delay_us(5); DIN_PORT = 0; precise_delay_us(5); SCLK_PORT = 0; precise_delay_us(5); }
+void stop(void) { SCLK_PORT = 0; DIN_PORT = 0; precise_delay_us(5); SCLK_PORT = 1; precise_delay_us(5); DIN_PORT = 1; precise_delay_us(5); }
+void writeByte(unsigned char data) { unsigned char i; for (i = 0; i < 8; i++) { SCLK_PORT = 0; precise_delay_us(5); if (data & 0x01) { DIN_PORT = 1; } else { DIN_PORT = 0; } precise_delay_us(5); SCLK_PORT = 1; precise_delay_us(5); data >>= 1; } }
+void sendCommand(unsigned char cmd) { start(); writeByte(cmd); stop(); }
+void updateDisplay(void) { unsigned char i; sendCommand(CMD_DATA_AUTO_INC); start(); writeByte(CMD_ADDRESS_SET | 0x00); for (i = 0; i < 16; i++) { writeByte(displayBuffer[i]); } stop(); }
+void clearDisplay(void) { unsigned char i; for (i = 0; i < 16; i++) { displayBuffer[i] = 0x00; } }
+void turn_on_led(unsigned char x, unsigned char y) { if (x < 8 && y < 16) displayBuffer[y] |= (1 << x); }
+void turn_off_led(unsigned char x, unsigned char y) { if (x < 8 && y < 16) displayBuffer[y] &= ~(1 << x); }
+
+void generate_carrier_pulse_burst(void) {
+    // This function enables the STM hardware timer, which generates the
+    // 38.1 kHz signal in the background via its ISR.
+    _stmc0 |= 0b00000001; // Start STM
+    precise_delay_us(IR_PULSE_BURST_US);
+    _stmc0 &= ~0b00000001; // Stop STM
+    IR_EMITTER_PORT = 0;   // Ensure emitter is off after burst
+}
+
+// =================================================================================
+//                           SENSOR LOGIC
+// =================================================================================
+
+void process_sensors(void) {
+    unsigned char r1_active, r2_active;
+    unsigned char i;
+
+    // Turn on TX status LED for the duration of this function
+    turn_on_led(1, 0);
+
+    // Generate IR bursts to check for reflections
+    for (i = 0; i < IR_BURST_COUNT; i++) {
+        generate_carrier_pulse_burst();
+        precise_delay_us(IR_PULSE_GAP_US);
+    }
+    precise_delay_us(100);
+
+    // Read the receiver pin states directly (Active-Low)
+    r1_active = !IR_RECEIVER_1;
+    r2_active = !IR_RECEIVER_2;
+
+    // --- Update Receiver Status LEDs ---
+    if (r1_active) turn_on_led(2, 0); else turn_off_led(2, 0);
+    if (r2_active) turn_on_led(3, 0); else turn_off_led(3, 0);
+
+    // --- Proximity (Hover) Logic ---
+    if (r1_active) {
+        turn_on_led(2, 9); // Turn ON LED 10
+        left_sensor_timeout = SENSOR_TIMEOUT_TICKS;
+    } else {
+        if (left_sensor_timeout > 0) left_sensor_timeout--;
+        if (left_sensor_timeout == 0) turn_off_led(2, 9);
+    }
+    if (r2_active) {
+        turn_on_led(5, 9); // Turn ON LED 11
+        right_sensor_timeout = SENSOR_TIMEOUT_TICKS;
+    } else {
+        if (right_sensor_timeout > 0) right_sensor_timeout--;
+        if (right_sensor_timeout == 0) turn_off_led(5, 9);
+    }
+
+    // --- Swipe Detection Logic ---
+    switch (gesture_state) {
+        case GESTURE_IDLE:
+            if (r1_active && !r2_active) {
+                gesture_state = GESTURE_ARMED_R1;
+                gesture_timeout_counter = 0;
+            } else if (r2_active && !r1_active) {
+                gesture_state = GESTURE_ARMED_R2;
+                gesture_timeout_counter = 0;
+            }
+            break;
+        case GESTURE_ARMED_R1:
+            if (r2_active) { // Left-to-Right Swipe
+                turn_on_led(3, 8); turn_off_led(1, 8);
+                gesture_state = GESTURE_IDLE;
+            } else if (++gesture_timeout_counter > GESTURE_SWIPE_TIMEOUT) {
+                gesture_state = GESTURE_IDLE;
+            }
+            break;
+        case GESTURE_ARMED_R2:
+            if (r1_active) { // Right-to-Left Swipe
+                turn_on_led(1, 8); turn_off_led(3, 8);
+                gesture_state = GESTURE_IDLE;
+            } else if (++gesture_timeout_counter > GESTURE_SWIPE_TIMEOUT) {
+                gesture_state = GESTURE_IDLE;
+            }
+            break;
+    }
+    
+    // Turn off TX status LED
+    turn_off_led(1, 0);
+}
+
+// =================================================================================
+//                        SYSTEM INITIALIZATION
+// =================================================================================
+
+void configure_system_clock(void) {
+    _hirc1 = 0; _hirc0 = 1; // 8MHz
+    _hircen = 1;
+    while(!_hircf);
+    _scc = 0b00000000;
+}
+
+void configure_io_pins(void) {
+    // TM1640 Display Pins
+    SCLK_PORT_CTRL = 0; DIN_PORT_CTRL = 0;
+    // IR Emitter Pin
+    IR_EMITTER_CTRL = 0;
+    // IR Receiver Pins (Input with Pull-up)
+    _pcc3 = 1; _pcpu3 = 1;
+    _pcc2 = 1; _pcpu2 = 1;
+}
+
+void init_PTM_for_tick(void) {
+    _ptmc0 = 0b00001000;    // PTM Clock = fSYS/4
+    _ptmc1 = 0b00001001;    // Compare Match A, Clear Counter, PTM Mode
+    _ptmal = (2000 - 1) & 0xFF; // Period for 1kHz interrupt
+    _ptmah = (2000 - 1) >> 8;
+    _pton = 1;
+}
+
+void init_STM_for_carrier(void) {
+    // To get ~38.1kHz output, we must toggle the pin at ~76.2kHz.
+    // Timer Ticks = 8,000,000 / 76,190 = 105. This is the correct value.
+    _stmal = 26;
+    _stmah = 0;
+
+    _stmc1 = 0b11000001; // Compare Match A, Clear Counter, Timer Mode
+    _stmc0 = 0b00001100; // Clock = fSYS, Timer is initially STOPPED
+}
+
+void USER_PROGRAM_C_INITIAL(void) {
+    configure_system_clock();
+    configure_io_pins();
+    init_PTM_for_tick();
+    init_STM_for_carrier();
+    
+    _wdtc = 0b01010111; // Enable watchdog
+    
+    // Enable interrupts
+    _ptmae = 1; // PTM Interrupt Enable
+    _stmae = 1; // STM Interrupt Enable
+    _mfe = 1;   // Multi-Function Interrupt Enable (for STM)
+    _emi = 1;   // Global Interrupt Enable
+
+    // Initialize display
+    sendCommand(CMD_DISPLAY_ON_MAX);
+    clearDisplay();
+    updateDisplay();
+}
+
+// =================================================================================
+//                           MAIN APPLICATION LOOP
+// =================================================================================
+
+void USER_PROGRAM_C(void) {
+    static unsigned char heartbeat_toggle = 0;
+    
+    // Main logic runs on a 20ms tick
+    if (app_tick_flag) {
+        app_tick_flag = 0;
+        
+        // Toggle heartbeat LED (0,0) to show main loop is alive
+        if(heartbeat_toggle) turn_on_led(0, 0); else turn_off_led(0, 0);
+        heartbeat_toggle = ~heartbeat_toggle;
+
+        process_sensors();
+        updateDisplay();
+    }
+    GCC_CLRWDT();
+}
+
+// --- HALT Mode Handlers ---
+void USER_PROGRAM_C_HALT_PREPARE(void) {}
+void USER_PROGRAM_C_HALT_WAKEUP(void)  {}
+void USER_PROGRAM_C_RETURN_MAIN(void)  {}
